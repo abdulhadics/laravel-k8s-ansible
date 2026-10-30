@@ -1,0 +1,139 @@
+---
+- name: Configure Kubernetes and deploy Laravel with a persistent database
+  hosts: local
+  become: true
+  vars:
+    project_dir: "{{ playbook_dir | dirname }}"
+    namespace: laravel-lab
+    cluster_backend: k3s
+    kube: "{{ '/usr/local/bin/k3s kubectl' if cluster_backend == 'k3s' else 'minikube kubectl --' }}"
+  tasks:
+    - name: Check Docker installation
+      ansible.builtin.command: docker --version
+      register: docker_check
+      failed_when: false
+      changed_when: false
+    - name: Install environment prerequisites
+      ansible.builtin.apt:
+        name: "{{ ['git', 'curl', 'ca-certificates'] + (['docker.io'] if docker_check.rc != 0 else []) }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+    - name: Start Docker
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+    - name: Download official K3s installer
+      ansible.builtin.get_url:
+        url: https://get.k3s.io
+        dest: /tmp/laravel-k3s-install.sh
+        mode: '0700'
+      when: cluster_backend == 'k3s'
+    - name: Install lightweight Kubernetes
+      ansible.builtin.command: sh /tmp/laravel-k3s-install.sh
+      args:
+        creates: /usr/local/bin/k3s
+      environment:
+        INSTALL_K3S_EXEC: server --disable traefik --disable servicelb --disable metrics-server
+      when: cluster_backend == 'k3s'
+    - name: Start K3s
+      ansible.builtin.service:
+        name: k3s
+        state: started
+        enabled: true
+      when: cluster_backend == 'k3s'
+    - name: Start Minikube when explicitly selected
+      ansible.builtin.command: minikube start --driver=docker --cpus=2 --memory=2048 --preload=false
+      become: false
+      when: cluster_backend == 'minikube'
+    - name: Wait for a Ready Kubernetes node
+      ansible.builtin.command: "{{ kube }} wait --for=condition=Ready node --all --timeout=180s"
+      become: "{{ cluster_backend == 'k3s' }}"
+      register: node_ready
+      retries: 6
+      delay: 5
+      until: node_ready.rc == 0
+      changed_when: false
+    - name: Create lab namespace
+      ansible.builtin.shell: "{{ kube }} create namespace {{ namespace }} --dry-run=client -o yaml | {{ kube }} apply -f -"
+      args:
+        executable: /bin/bash
+      become: "{{ cluster_backend == 'k3s' }}"
+    - name: Check existing credentials
+      ansible.builtin.command: "{{ kube }} -n {{ namespace }} get secret laravel-secret"
+      become: "{{ cluster_backend == 'k3s' }}"
+      register: existing_secret
+      failed_when: false
+      changed_when: false
+    - name: Generate and store application and database credentials
+      ansible.builtin.shell: |
+        set -euo pipefail
+        app_key="base64:$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
+        db_password="$(head -c 24 /dev/urandom | base64 | tr -d '\n')"
+        root_password="$(head -c 24 /dev/urandom | base64 | tr -d '\n')"
+        {{ kube }} -n {{ namespace }} create secret generic laravel-secret \
+          --from-literal=APP_KEY="$app_key" \
+          --from-literal=DB_PASSWORD="$db_password" \
+          --from-literal=DB_ROOT_PASSWORD="$root_password"
+      args:
+        executable: /bin/bash
+      become: "{{ cluster_backend == 'k3s' }}"
+      no_log: true
+      when: existing_secret.rc != 0
+    - name: Build actual Laravel application image
+      ansible.builtin.command: "docker build -t laravel-lab:local {{ project_dir }}"
+    - name: Save image for K3s
+      ansible.builtin.command: docker save -o /tmp/laravel-lab-image.tar laravel-lab:local
+      when: cluster_backend == 'k3s'
+    - name: Import image into Kubernetes containerd
+      ansible.builtin.command: /usr/local/bin/k3s ctr -n k8s.io images import /tmp/laravel-lab-image.tar
+      when: cluster_backend == 'k3s'
+    - name: Remove temporary image archive
+      ansible.builtin.file:
+        path: /tmp/laravel-lab-image.tar
+        state: absent
+      when: cluster_backend == 'k3s'
+    - name: Load image into Minikube when selected
+      ansible.builtin.command: minikube image load laravel-lab:local
+      become: false
+      when: cluster_backend == 'minikube'
+    - name: Deploy persistent database
+      ansible.builtin.command: "{{ kube }} -n {{ namespace }} apply -f {{ project_dir }}/k8s/database.yaml"
+      become: "{{ cluster_backend == 'k3s' }}"
+    - name: Wait for database readiness
+      ansible.builtin.command: "{{ kube }} -n {{ namespace }} rollout status deployment/mysql --timeout=300s"
+      become: "{{ cluster_backend == 'k3s' }}"
+      changed_when: false
+    - name: Deploy Laravel and NodePort service
+      ansible.builtin.command: "{{ kube }} -n {{ namespace }} apply -f {{ project_dir }}/k8s/application.yaml"
+      become: "{{ cluster_backend == 'k3s' }}"
+    - name: Refresh application pods after local image build
+      ansible.builtin.command: "{{ kube }} -n {{ namespace }} rollout restart deployment/laravel"
+      become: "{{ cluster_backend == 'k3s' }}"
+    - name: Wait for application and database readiness
+      ansible.builtin.command: "{{ kube }} -n {{ namespace }} rollout status deployment/laravel --timeout=300s"
+      become: "{{ cluster_backend == 'k3s' }}"
+      changed_when: false
+    - name: Find Minikube access address
+      ansible.builtin.command: minikube ip
+      become: false
+      register: minikube_ip
+      changed_when: false
+      when: cluster_backend == 'minikube'
+    - name: Verify exposed application and database query
+      ansible.builtin.uri:
+        url: "http://{{ '127.0.0.1' if cluster_backend == 'k3s' else minikube_ip.stdout }}:30080/health/db"
+        return_content: true
+        status_code: 200
+      register: health
+      retries: 12
+      delay: 5
+      until: health.status | default(0) == 200
+    - name: Require a successful database connection
+      ansible.builtin.assert:
+        that:
+          - health.json.database == 'connected'
+    - name: Show access URL
+      ansible.builtin.debug:
+        msg: "Verified Laravel + database. Open http://{{ ansible_facts.default_ipv4.address if cluster_backend == 'k3s' else minikube_ip.stdout }}:30080"
